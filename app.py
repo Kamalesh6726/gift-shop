@@ -1,32 +1,37 @@
 import os
 import sqlite3
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify
+
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
 # Optional: Twilio for SMS
-# pip install twilio
 from twilio.rest import Client
+
+
+# ---------------- CONFIG ----------------
 
 DB_PATH = os.environ.get("DB_PATH", "inventory.db")
 
-# --- SMS config ---
+# Twilio (SMS) config (set in Railway Variables)
 TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_FROM = os.environ.get("TWILIO_FROM_NUMBER", "")
 
-# Per-shop recipient numbers (edit to your needs)
 SHOP_ALERT_NUMBERS = {
-    "glory": os.environ.get("SHOP_GLORY_TO", ""),     # e.g. +91XXXXXXXXXX
-    "footwear": os.environ.get("SHOP_FOOTWEAR_TO", "")# e.g. +91XXXXXXXXXX
+    "glory": os.environ.get("SHOP_GLORY_TO", ""),
+    "footwear": os.environ.get("SHOP_FOOTWEAR_TO", "")
 }
 
-# throttle alerts to avoid spam (per SKU)
 ALERT_COOLDOWN_MINUTES = int(os.environ.get("ALERT_COOLDOWN_MINUTES", "60"))
+
+# ---------------- APP INIT ----------------
 
 app = Flask(__name__)
 CORS(app)
 
+
+# ---------------- DATABASE ----------------
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -36,8 +41,7 @@ def get_db():
 
 def init_db():
     conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,20 +58,13 @@ def init_db():
     conn.close()
 
 
-from twilio.rest import Client
+# ---------------- SMS LOGIC ----------------
 
 def send_sms(to_number: str, product_name: str, current_qty: int):
-    """
-    Sends low stock SMS alert.
-    Requires TWILIO_* env vars and 'to_number' to be set.
-    """
-
     if not (TWILIO_SID and TWILIO_TOKEN and TWILIO_FROM and to_number):
-        # Skip safely if misconfigured
-        print("[SMS] Skipped: Twilio/recipient not configured.")
+        print("[SMS] Skipped (Twilio not configured)")
         return
 
-    # ✅ Final SMS message format
     message = (
         "⚠️ Low Stock Alert\n\n"
         f"Product: {product_name}\n"
@@ -82,52 +79,68 @@ def send_sms(to_number: str, product_name: str, current_qty: int):
             from_=TWILIO_FROM,
             body=message
         )
-        print("[SMS] Sent successfully")
-
+        print("[SMS] Sent")
     except Exception as e:
         print("[SMS] Error:", e)
 
 
-
 def maybe_alert_low_stock(product):
-    """
-    Send low-stock SMS if quantity <= threshold and we haven't alerted recently.
-    """
     qty = product["quantity"]
     thr = product["reorder_threshold"]
+
+    if qty > thr:
+        return
+
     shop = product["shop_name"]
     sku = product["sku"]
     name = product["name"]
-    to = SHOP_ALERT_NUMBERS.get(shop)
-    if to is None:
-        to = ""  # no number configured
+    to = SHOP_ALERT_NUMBERS.get(shop, "")
 
-    if qty <= thr:
-        # check cooldown
-        last = product["last_alert_at"]
-        now = datetime.utcnow()
-        should_send = True
-        if last:
-            try:
-                last_dt = datetime.fromisoformat(last)
-                if now - last_dt < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
-                    should_send = False
-            except Exception:
-                pass
+    now = datetime.utcnow()
+    last = product["last_alert_at"]
 
-        if should_send:
-            send_sms(to, name, qty)
+    if last:
+        try:
+            last_dt = datetime.fromisoformat(last)
+            if now - last_dt < timedelta(minutes=ALERT_COOLDOWN_MINUTES):
+                return
+        except Exception:
+            pass
+
+    send_sms(to, name, qty)
+
+    conn = get_db()
+    conn.execute(
+        "UPDATE products SET last_alert_at=? WHERE sku=?",
+        (now.isoformat(timespec="seconds"), sku)
+    )
+    conn.commit()
+    conn.close()
 
 
-            # update last_alert_at
-            conn = get_db()
-            conn.execute(
-                "UPDATE products SET last_alert_at=? WHERE sku=?",
-                (now.isoformat(timespec="seconds"), sku),
-            )
-            conn.commit()
-            conn.close()
+# ---------------- FRONTEND ROUTES ----------------
 
+@app.route("/")
+def home():
+    return send_from_directory(".", "shop.html")
+
+
+@app.route("/stationary")
+def stationary_page():
+    return send_from_directory(".", "stationary.html")
+
+
+@app.route("/app.js")
+def serve_js():
+    return send_from_directory(".", "app.js")
+
+
+@app.route("/<path:filename>")
+def serve_static(filename):
+    return send_from_directory(".", filename)
+
+
+# ---------------- API ROUTES ----------------
 
 @app.route("/api/products", methods=["GET"])
 def list_products():
@@ -142,12 +155,11 @@ def list_products():
 @app.route("/api/products", methods=["POST"])
 def create_product():
     data = request.get_json(force=True)
-    # expected by your front-end: shop_name, sku, name, quantity, reorder_threshold
-    # (matches the fetch body in app.js addProduct) :contentReference[oaicite:1]{index=1}
+
     required = ["shop_name", "sku", "name", "quantity", "reorder_threshold"]
-    for k in required:
-        if k not in data:
-            return jsonify({"error": f"Missing field: {k}"}), 400
+    for field in required:
+        if field not in data:
+            return jsonify({"error": f"Missing field: {field}"}), 400
 
     try:
         conn = get_db()
@@ -165,14 +177,17 @@ def create_product():
             ),
         )
         conn.commit()
-        # fetch back the product for alert logic
+
         row = conn.execute(
-            "SELECT shop_name, sku, name, quantity, reorder_threshold, last_alert_at FROM products WHERE sku=?",
-            (data["sku"],),
+            "SELECT * FROM products WHERE sku=?",
+            (data["sku"],)
         ).fetchone()
+
         conn.close()
         maybe_alert_low_stock(dict(row))
+
         return jsonify({"status": "ok"}), 201
+
     except sqlite3.IntegrityError:
         return jsonify({"error": "SKU already exists"}), 409
 
@@ -184,30 +199,37 @@ def adjust_quantity(sku):
 
     conn = get_db()
     row = conn.execute(
-        "SELECT shop_name, sku, name, quantity, reorder_threshold, last_alert_at FROM products WHERE sku=?",
-        (sku,),
+        "SELECT * FROM products WHERE sku=?",
+        (sku,)
     ).fetchone()
+
     if not row:
         conn.close()
         return jsonify({"error": "SKU not found"}), 404
 
-    new_qty = row["quantity"] + delta
-    if new_qty < 0:
-        new_qty = 0
+    new_qty = max(row["quantity"] + delta, 0)
 
-    conn.execute("UPDATE products SET quantity=? WHERE sku=?", (new_qty, sku))
+    conn.execute(
+        "UPDATE products SET quantity=? WHERE sku=?",
+        (new_qty, sku)
+    )
     conn.commit()
+
     row = conn.execute(
-        "SELECT shop_name, sku, name, quantity, reorder_threshold, last_alert_at FROM products WHERE sku=?",
-        (sku,),
+        "SELECT * FROM products WHERE sku=?",
+        (sku,)
     ).fetchone()
+
     conn.close()
-
     maybe_alert_low_stock(dict(row))
-    return jsonify({"status": "ok", "sku": sku, "quantity": row["quantity"]})
 
+    return jsonify({"status": "ok", "sku": sku, "quantity": new_qty})
+
+
+# ---------------- MAIN (Railway) ----------------
 
 if __name__ == "__main__":
     init_db()
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    port = int(os.environ.get("PORT", 8000))
+    app.run(host="0.0.0.0", port=port)
+
