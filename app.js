@@ -1,6 +1,7 @@
 /*************************************************
  * FRIENDZ STATIONERY – FINAL app.js (STABLE)
  *************************************************/
+const API_BASE = "https://gift-shop-1-jpqm.onrender.com";
 
 const STORAGE_KEY = "friendz_items";
 const PROFIT_PIN = "1234";
@@ -252,3 +253,4 @@ function renderAadhaarPayments() {
     `;
   });
 }
+
